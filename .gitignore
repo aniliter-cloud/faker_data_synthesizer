@@ -1,0 +1,5 @@
+venvds/
+rows*/
+__pycache__/
+*.csv
+.DS_Store

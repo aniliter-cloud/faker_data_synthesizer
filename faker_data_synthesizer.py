@@ -2,7 +2,7 @@ from faker import Faker
 from faker.providers import BaseProvider
 import numpy as np
 import pandas as pd
-from decimal import Decimal
+import time
 
 
 
@@ -10,16 +10,16 @@ from decimal import Decimal
 COLS = 10
 
 CLUSTER_PLAN = {
-    10_000:  [3, 5, 7],
-    50_000:  [7, 9, 11],
-    100_000: [13, 15, 17],
+    1_000_000:  [3, 5, 7],
+    5_000_000:  [7, 9, 11],
+    10_000_000: [13, 15, 17],
 }
 
 MAX_ROWS   = list(CLUSTER_PLAN)
 
 N_CLUSTERS = 5
 SEED       = 42
-SCALE      = Decimal("1." + "0" * 16)
+DECIMALS   = 16                     # DECIMAL(32,16) -> 16 decimal places in CSV
 
 class ColIdProvider(BaseProvider):
     """
@@ -55,6 +55,8 @@ def make_faker(seed: int | None = SEED) -> Faker:
 def synthesizer(max_rows: int, cols: int, n_clusters:int = N_CLUSTERS,seed:int | None =SEED):
     """
     Generates a synthetic dataset with specified number of rows, columns, and clusters.
+    Features are generated with vectorised NumPy (fast for millions of rows);
+    IDs still come from faker.col_id().
 
     Parameters:
     - max_rows (int): The maximum number of rows in the dataset.
@@ -64,28 +66,25 @@ def synthesizer(max_rows: int, cols: int, n_clusters:int = N_CLUSTERS,seed:int |
 
     Returns:
     - pd.DataFrame: A DataFrame containing the synthetic dataset.
+    - np.ndarray: True cluster label per row (0..K-1).
     """
 
     faker = make_faker(seed)
-    rnd = faker.random
+    rng = np.random.default_rng(seed)
     col_names = ["ID"] + [f"col_{i}" for i in range(1, cols)]
     n_feat = cols - 1
 
-    centers = [[rnd.uniform(-100, 1000) for _ in range(n_feat)] for _ in range(n_clusters)]
-    std = [rnd.uniform(1, 10) for _ in range(n_clusters)]
+    centers = rng.uniform(-100, 1000, size=(n_clusters, n_feat))
+    std = rng.uniform(1, 10, size=n_clusters)
 
-    rows, labels = [], []
-    for i in range(max_rows):
-        cluster = rnd.randint(0, n_clusters - 1)
-        labels.append(cluster)                      # int label: 0..K-1
+    # one cluster per row, then all values at once: centre + noise * std
+    labels = rng.integers(0, n_clusters, size=max_rows)
+    values = centers[labels] + rng.standard_normal((max_rows, n_feat)) * std[labels, None]
 
-        row = [faker.col_id()]
-        for j in range(n_feat):
-            value = rnd.gauss(centers[cluster][j], std[cluster])
-            row.append(Decimal(repr(value)).quantize(SCALE))
-        rows.append(row)
+    df = pd.DataFrame(values, columns=col_names[1:])
+    df.insert(0, "ID", [faker.col_id() for _ in range(max_rows)])
 
-    return pd.DataFrame(rows, columns=col_names), np.array(labels)
+    return df, labels
 
 
 def ddl(table_name: str, cols: int) -> str:
@@ -105,9 +104,19 @@ def ddl(table_name: str, cols: int) -> str:
     return ddl_statement
 
 
+def save(df: pd.DataFrame, labels: np.ndarray, max_rows: int, cols: int, k: int) -> str:
+    """Adds true_label and writes the CSV into rows<N>/ (created if missing)."""
+    import os
+    folder = f"rows{max_rows}"
+    os.makedirs(folder, exist_ok=True)
+    name = os.path.join(folder, f"synthetic_data_{max_rows}_rows_{cols}_cols_{k}_clusters.csv")
+    df["true_label"] = labels               # answer key; drop before K-means
+    df.to_csv(name, index=False, float_format=f"%.{DECIMALS}f")
+    return name
+
+
 if __name__ == "__main__":
     import argparse
-    import os
     parser = argparse.ArgumentParser()
     parser.add_argument("--rows", type=int, help="rows for a single test run")
     parser.add_argument("--cols", type=int, default=COLS, help="total cols incl. ID")
@@ -117,31 +126,21 @@ if __name__ == "__main__":
 
     print(ddl("synthetic_data", args.cols))
 
-    # custom run: python data_synthesizer.py --rows 10 --cols 10 --clusters 3 5 7
+    # custom run: python faker_data_synthesizer.py --rows 10 --cols 10 --clusters 3 5 7
     if args.rows:
-        for k in args.clusters:
-            df, labels = synthesizer(args.rows, args.cols, n_clusters=k)
-            print(df)
-            print(labels)
-            folder = f"rows{args.rows}"
-            os.makedirs(folder, exist_ok=True)      # create if not present
-            name = os.path.join(folder, f"synthetic_data_{args.rows}_rows_{args.cols}_cols_{k}_clusters.csv")
-            df["true_label"] = labels               # answer key; drop before K-means
-            df.to_csv(name, index=False)
-            print(f"Saved synthetic dataset to {name}.")
-        raise SystemExit
+        plan, cols = {args.rows: args.clusters}, args.cols
+    else:
+        plan, cols = CLUSTER_PLAN, COLS      # full plan: 1M / 5M / 10M
 
-    # full plan (no --rows): 9 datasets
-    for max_rows, clusters in CLUSTER_PLAN.items():
+    for max_rows, clusters in plan.items():
         for k in clusters:
-            df, labels = synthesizer(max_rows, COLS, n_clusters=k)
-            print(f"Generated DataFrame with {max_rows} rows and {COLS} columns for {k} clusters.")
+            t0 = time.perf_counter()
+            df, labels = synthesizer(max_rows, cols, n_clusters=k)
+            t1 = time.perf_counter()
             print(df.head())
-            folder = f"rows{max_rows}"
-            os.makedirs(folder, exist_ok=True)      # create if not present
-            name = os.path.join(folder, f"synthetic_data_{max_rows}_rows_{COLS}_cols_{k}_clusters.csv")
-            df.to_csv(name, index=False)
-            print(f"Saved synthetic dataset to {name}.")
+            name = save(df, labels, max_rows, cols, k)
+            t2 = time.perf_counter()
+            print(f"Saved {name}  (generate {t1 - t0:.1f}s, write {t2 - t1:.1f}s)")
 
     faker1, faker2 = make_faker(seed=SEED), make_faker(seed=SEED)
     assert faker1.col_id() == faker2.col_id(), "Faker instances with the same seed should produce the same column ID."

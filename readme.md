@@ -27,7 +27,7 @@ python data_synthesizer.py
 
 **Custom run:**
 ```bash
-python data_synthesizer.py --rows 10 --cols 10 --clusters 3 5 7
+python faker_data_synthesizer.py --rows 10 --cols 10 --clusters 3 5 7
 ```
 
 | Argument     | Default | Description                                   |

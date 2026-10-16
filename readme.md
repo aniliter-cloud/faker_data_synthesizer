@@ -94,6 +94,19 @@ X = df.drop(columns=["ID", "true_label"]).astype("float32").to_numpy()
   ```
 - Verify files match with `shasum rows10/*.csv`.
 
+## To execute the code using Parallel Reduction
+- Use the file `kmeans_parallel_red.ipynb`
+
+
+## For Nvidia Nsight analysis
+
+- Install using following `!pip install -q jupyterlab-nvidia-nsight nvtx`
+- Restart your server and session
+- Enable Nsight using `%nsys enable --trace=cuda,nvtx`
+- Add this in your main cell at start `%%nsys --stats=true`
+- A file will be generated, open the file using Nsight Systems software
+
+
 ## Precision note
 
 Values are generated as float64 (~15–16 significant digits), then stored as `DECIMAL(32,16)`; trailing decimal digits are zero-padded. Cast to `float32` for GPU K-means.

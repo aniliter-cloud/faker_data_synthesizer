@@ -1,112 +1,136 @@
-# Data Synthesizer
+# GPU K-Means: Atomic, Reduction and Fused Assignment
 
-Generates reproducible synthetic, clustered datasets with Faker for benchmarking **K-means clustering on GPU**.
+We compare a CPU baseline with CUDA implementations of Lloyd's K-Means using
+global atomics, shared-memory reductions and a custom fused dot-score/argmin
+kernel. Our dimension sweep retains every row and the dataset's K while selecting
+the first **2, 4 or 9 features**.
 
-## Setup
+- [Git repository](https://github.com/aniliter-cloud/kmeans-gpu-grp-project)
+- [Benchmark results and profiling files](https://drive.google.com/drive/folders/1QWPLpS4KsT1SCrnX12BwzoZomqfjtgBh?usp=drive_link)
+- [Two-page assignment report](KMEANS_PROJECT_REPORT.pdf)
+
+## 1. Generate the data locally
 
 ```bash
-python3 -m venv venvds
-source venvds/bin/activate          # Windows: venvds\Scripts\Activate.ps1
-pip install -r requirements.txt     # or: pip install faker pandas numpy
+git clone https://github.com/aniliter-cloud/kmeans-gpu-grp-project.git
+cd kmeans-gpu-grp-project
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
 ```
 
-Requires Python 3.10+.
+On Windows, activate with `.venv\Scripts\Activate.ps1`.
+The generator and preparation script only require Faker, NumPy and pandas; a GPU
+is not needed for this step. The checked-in dependency snapshot differs from the
+recorded benchmark environment; see [reproducibility notes](docs/EXPERIMENTS_AND_RESULTS.md#environment-and-reproducibility).
 
-## Run
+`faker_data_synthesizer.py` creates clustered float64 features and Faker UUIDs.
+With no arguments it generates **nine large datasets**:
 
-**Full plan** (9 datasets from `CLUSTER_PLAN`):
+| N (rows) | K values |
+|---:|---|
+| 1,000,000 | 3, 5, 7 |
+| 5,000,000 | 7, 9, 11 |
+| 10,000,000 | 13, 15, 17 |
+
+To reproduce the complete **18-dataset** benchmark collection, also generate
+the three smaller row groups:
+
 ```bash
-python data_synthesizer.py
+python faker_data_synthesizer.py
+python faker_data_synthesizer.py --rows 10000 --cols 10 --clusters 3 5 7
+python faker_data_synthesizer.py --rows 50000 --cols 10 --clusters 7 9 11
+python faker_data_synthesizer.py --rows 100000 --cols 10 --clusters 13 15 17
+python prepare_initial_centroids.py --data-root .
 ```
 
-| Rows    | Clusters (K) |
-|---------|--------------|
-| 10,000  | 3, 5, 7      |
-| 50,000  | 7, 9, 11     |
-| 100,000 | 13, 15, 17   |
+Generation is sequential and the larger CSVs need substantial disk space and
+memory. `--cols 10` means ID plus nine features; the appended `true_label` makes
+11 physical CSV columns. Older supplied files may omit `true_label`.
 
-**Custom run:**
-```bash
-python faker_data_synthesizer.py --rows 10 --cols 10 --clusters 3 5 7
+The preparation script samples K rows with seed 42 once in full 9D and writes
+canonical initial-centroid CSVs. It reuses existing valid references without
+overwriting them. Generate new experiments in a separate data root rather than
+mixing regenerated data with old canonical files or completed results.
+
+## 2. Upload to Google Drive
+
+Upload the generated `rows*` folders and `results_gpu_atomic_v3` together:
+
+```text
+MyDrive/kmeans_data/
+  rows10000/
+  rows50000/
+  rows100000/
+  rows1000000/
+  rows5000000/
+  rows10000000/
+  results_gpu_atomic_v3/
+    initial_centroids_synthetic_data_<N>_rows_10_cols_<K>_clusters.csv
 ```
 
-| Argument     | Default | Description                                   |
-|--------------|---------|-----------------------------------------------|
-| `--rows`     | —       | Rows per dataset. If omitted, runs full plan  |
-| `--cols`     | 10      | Total columns, including `ID`                 |
-| `--clusters` | 3       | One or more K values; one file per K          |
+Upload completed CSVs without changing their names or row order. The notebooks
+also recognize `results_gpu_atomic_v3 2` as an optional sibling folder when
+reference files were downloaded in multiple parts.
 
-## Output
+## 3. Run the notebooks in Colab
 
-Files are saved in a `rows<N>/` folder (created if missing):
+| Notebook | Purpose |
+|---|---|
+| `kmeans_cpu_baseline_V3_ALIGNED.ipynb` | CPU Numba baseline and repeated fixed-iteration timing |
+| `kmeans_parallel_atomic_V3_ALIGNED.ipynb` | CUDA assignment and global-atomic sums/counts |
+| `kmeans_parallel_reduction_V3_ALIGNED.ipynb` | CUDA assignment and shared-memory scan reductions |
+| `kmeans_gemm_fused_V3_ALIGNED.ipynb` | Fused dot-score/argmin assignment and atomic accumulation |
 
-```
-rows10/
-  synthetic_data_10_rows_10_cols_3_clusters.csv
-  synthetic_data_10_rows_10_cols_5_clusters.csv
-  synthetic_data_10_rows_10_cols_7_clusters.csv
-```
+Open a notebook in Colab, mount Drive, and confirm its data root points to
+`/content/drive/MyDrive/kmeans_data`. Use a CPU runtime for the baseline and an
+NVIDIA GPU runtime for the CUDA notebooks. The GPU notebooks require Numba CUDA;
+the fused notebook also requires CuPy. Confirm the GPU with `!nvidia-smi`.
 
-### Schema
-
-```sql
-CREATE TABLE synthetic_data (
-  ID CHAR(32),               -- uuid4 hex via faker.col_id()
-  col_1 DECIMAL(32, 16),     -- features col_1 ... col_9
-  ...
-  col_9 DECIMAL(32, 16),
-  true_label INT             -- cluster the row was generated from (0..K-1)
-);
-```
-
-## How the data is generated
-
-1. Pick K random cluster centres in 9-D space, each coordinate in [-1000, 1000].
-2. Pick a spread (std 1–10) per cluster.
-3. For each row: choose a random cluster, generate an `ID`, and draw each feature from a Gaussian around that cluster's centre.
-4. Round features to `DECIMAL(32,16)` and store the cluster as `true_label`.
-
-## Using with K-means
-
-Drop `ID` and `true_label` before clustering; use `true_label` only for scoring.
+Keep the full-run settings:
 
 ```python
-import pandas as pd
-from sklearn.metrics import adjusted_rand_score
-
-df = pd.read_csv("rows10000/synthetic_data_10000_rows_10_cols_5_clusters.csv")
-X = df.drop(columns=["ID", "true_label"]).astype("float32").to_numpy()
-
-# GPU (cuML, Linux/WSL2 + NVIDIA):
-# import cupy as cp
-# from cuml.cluster import KMeans
-# km = KMeans(n_clusters=5, random_state=42).fit(cp.asarray(X))
-# score = adjusted_rand_score(df["true_label"], km.labels_.get())
+FEATURE_DIMS = [2, 4, 9]
+SWEEP_CASES = None
 ```
 
-## Reproducibility
+Run cells from the top. Atomic/Reduction also default to `RUN_MODE = "all"`.
+The prepared canonical files allow the notebooks to run in any order. We never
+cluster ID or `true_label`; each D uses matching columns from the same canonical
+centroid rows. No N value needs to be entered for the batch.
 
-- `SEED = 42` gives identical output for the same arguments on any machine.
-- Different K, rows, cols or seed produce different data.
-- Pin library versions so others get the same data:
-  ```bash
-  pip freeze > requirements.txt
-  ```
-- Verify files match with `shasum rows10/*.csv`.
+In the fused notebook, Parts A-D demonstrate one case; their `ROWS`, `K` and
+`FEATURE_DIM` settings do not restrict Part E. Part E contains the standard
+18-dataset batch list. Generate the full collection above before running it.
+`SUM_METHOD = "atomic"` is the audited sweep variant; `"shared"` writes a
+separate experimental result folder.
 
-## To execute the code using Parallel Reduction
-- Use the file `kmeans_parallel_red.ipynb`
+## 4. Results and comparison
 
+Each implementation writes a new `*_dimension_sweep` result folder with a
+summary and `_D2`, `_D4` or `_D9` per-case files. The full collection produces
+**54 cases per implementation**. Keep the environment JSON, histories and
+assignment subfolders when downloading; Drive may split large downloads.
+The CPU packaging cell now copies staged assignments before creating a recursive
+ZIP. The fused notebook currently saves centroids/sizes and histories, but does
+not export per-point assignments.
 
-## For Nvidia Nsight analysis
+Compare the same source dataset, N, K and D, and check initial-centroid hashes.
+CPU performs a final nearest-centroid reassignment after stopping; GPU files
+retain labels from the last iteration. This explains small differences in
+exported cluster sizes and WCSS despite matching iterative centroids. CPU
+fixed-iteration medians and GPU convergence times are different measurements.
 
-- Install using following `!pip install -q jupyterlab-nvidia-nsight nvtx`
-- Restart your server and session
-- Enable Nsight using `%nsys enable --trace=cuda,nvtx`
-- Add this in your main cell at start `%%nsys --stats=true`
-- A file will be generated, open the file using Nsight Systems software
+We validated 54 final cases per method. Fused assignment is not consistently
+fastest across all shapes. See [experiments and results](docs/EXPERIMENTS_AND_RESULTS.md)
+for the timings, numerical checks and remaining download gaps.
 
+## Design and profiling
 
-## Precision note
+- [Implementation design](docs/IMPLEMENTATION_DESIGN.md)
+- [Experiments, results and reproducibility](docs/EXPERIMENTS_AND_RESULTS.md)
+- [Nsight profiling evidence and procedure](docs/PROFILING.md)
 
-Values are generated as float64 (~15–16 significant digits), then stored as `DECIMAL(32,16)`; trailing decimal digits are zero-padded. Cast to `float32` for GPU K-means.
+The fused iterative path uses a custom CUDA kernel based on the GEMM distance
+identity; its standalone CuPy experiment invokes cuBLAS separately. Nsight kernel
+times and complete convergence timings must be reported with their own scopes.
